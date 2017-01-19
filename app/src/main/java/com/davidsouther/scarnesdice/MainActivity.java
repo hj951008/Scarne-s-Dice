@@ -10,6 +10,12 @@ import android.widget.TextView;
 
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.database.ChildEventListener;
+import com.google.firebase.database.DataSnapshot;
+import com.google.firebase.database.DatabaseError;
+import com.google.firebase.database.DatabaseReference;
+import com.google.firebase.database.FirebaseDatabase;
+import com.google.firebase.database.ValueEventListener;
 
 import java.util.Random;
 
@@ -25,12 +31,10 @@ public class MainActivity extends AppCompatActivity {
     private FirebaseUser mFirebaseUser;
     private String mUserEmail;
 
-    private int currentTurn;
-    private int playerTotal;
-    private int computerTotal;
+    private DatabaseReference mFirebaseDatabase;
 
-    private Players whosTurn = Players.PLAYER;
-    private int computerTurns = 0;
+    private PlayerState state;
+    private ScarnesDiceGame game;
 
     private Random random;
 
@@ -54,6 +58,13 @@ public class MainActivity extends AppCompatActivity {
             return;
         } else {
             mUserEmail = mFirebaseUser.getEmail();
+            mUserEmail = mUserEmail.substring(0, mUserEmail.indexOf('@'))
+                    .replace('.', '_')
+                    .replace('#', '_')
+                    .replace('$', '_')
+                    .replace('[', '_')
+                    .replace(']', '_');
+            configureDatabase();
         }
 
         setContentView(R.layout.activity_main);
@@ -66,121 +77,89 @@ public class MainActivity extends AppCompatActivity {
 
         actionText.setText(String.format("%d", 5));
 
-        resetScores();
+        dieView.setImageResource(R.drawable.empty);
+        dieView.setContentDescription("Empty die face");
+        computerScoreText.setText("0");
+        playerScoreText.setText("0");
+        turnScoreText.setText("0");
+        actionText.setText("");
     }
 
-    @Override
-    public void onPause() {
-        super.onPause();
+    private void configureDatabase() {
+        mFirebaseDatabase = FirebaseDatabase.getInstance().getReference();
+
+        mFirebaseDatabase.child("players").addChildEventListener(new ChildEventListener() {
+            @Override
+            public void onChildAdded(DataSnapshot dataSnapshot, String s) {
+                PlayerState state = dataSnapshot.getValue(PlayerState.class);
+                // If both READY, start a game!
+                if (state.getStatus() == PlayerStatus.READY && MainActivity.this.state.getStatus() == PlayerStatus.READY) {
+                    startGame(state);
+                }
+            }
+
+            @Override
+            public void onChildChanged(DataSnapshot dataSnapshot, String s) {}
+
+            @Override
+            public void onChildRemoved(DataSnapshot dataSnapshot) {}
+
+            @Override
+            public void onChildMoved(DataSnapshot dataSnapshot, String s) {}
+
+            @Override
+            public void onCancelled(DatabaseError databaseError) {}
+        });
+
+        state = new PlayerState(mUserEmail);
+        mFirebaseDatabase.child("players").child(state.getId()).setValue(state);
     }
 
-    public void roll(View view) {
-        int frame = rollDice();
+    private void startGame(PlayerState otherState) {
+        game = new ScarnesDiceGame(state.getEmail(), otherState.getEmail(), random.nextBoolean() ? MultiPlayers.PLAYER1 : MultiPlayers.PLAYER2);
+        mFirebaseDatabase.child("games").push().setValue(game);
 
-        if (frame == 1) {
-            changePlayers();
+        state.setGameId(game.getId());
+        state.setStatus(PlayerStatus.IN_GAME);
+        otherState.setGameId(game.getId());
+        otherState.setStatus(PlayerStatus.IN_GAME);
+
+        mFirebaseDatabase.child("players").child(state.getId()).setValue(state);
+        mFirebaseDatabase.child("players").child(otherState.getId()).setValue(otherState);
+
+        mFirebaseDatabase.child("games").child(game.getId()).addValueEventListener(new ValueEventListener() {
+            @Override
+            public void onDataChange(DataSnapshot dataSnapshot) {
+                game = dataSnapshot.getValue(ScarnesDiceGame.class);
+                updateGameView();
+            }
+
+            @Override
+            public void onCancelled(DatabaseError databaseError) {}
+        });
+    }
+
+
+    private void updateGameView() {
+        playerScoreText.setText(String.format("%d", game.getPlayer1Score()));
+        computerScoreText.setText(String.format("%d", game.getPlayer2Score()));
+        turnScoreText.setText(String.format("%d", game.getCurrentTurn()));
+        int roll = game.getLastRoll();
+        if (roll == 1) {
             actionText.setText(R.string.change_players);
-            turnScoreText.setText("");
-            resetTurn();
+        } else if (currentPlayer()) {
+            actionText.setText("It is your turn!");
         } else {
-            actionText.setText("");
-            currentTurn += frame;
-            turnScoreText.setText(String.valueOf(currentTurn));
+            actionText.setText("Waiting for other player");
+        }
+
+        if (roll > 0) {
+            showRoll(roll);
             checkForWin();
         }
     }
 
-    private void computerTurn() {
-        if (computerTurns < 3 || currentTurn < (3.5 * computerTurns)) {
-            roll(null);
-            computerTurns += 1;
-        } else {
-            hold(null);
-        }
-    }
-
-    final Handler timerHandler = new Handler();
-    private void computerTurnIn500() {
-        timerHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                computerTurn();
-                if (whosTurn == Players.COMPUTER) {
-                    computerTurnIn500();
-                }
-            }
-        }, 500);
-    }
-
-    private void checkForWin() {
-        switch (whosTurn) {
-            case PLAYER: if (playerTotal + currentTurn > 25) playerWins(); break;
-            case COMPUTER: if (computerTotal + currentTurn > 100) computerWins(); break;
-        }
-    }
-
-    public static final String USER_SCORE = "com.davidsouther.scarne.USER_SCORE";
-    private void playerWins() {
-        Intent intent = new Intent(this, WinActivity.class);
-        intent.putExtra(USER_SCORE, String.valueOf(playerTotal + currentTurn));
-        startActivity(intent);
-        resetScores();
-    }
-
-    private void computerWins() {
-        startActivity(new Intent(this, LoseActivity.class));
-        resetScores();
-    }
-
-    private void changePlayers() {
-        switch (whosTurn) {
-            case PLAYER:
-                whosTurn = Players.COMPUTER;
-                computerTurnIn500();
-                break;
-            case COMPUTER:
-                whosTurn = Players.PLAYER;
-                break;
-        }
-    }
-
-    private void playerScores(int turnTotal) {
-        actionText.setText(String.format(
-                getString(R.string.player_scores), turnTotal));
-        playerTotal += turnTotal;
-        playerScoreText.setText(String.valueOf(playerTotal));
-    }
-
-    private void computerScores(int turnTotal) {
-        actionText.setText(String.format("Computer scores %d", turnTotal));
-        computerTotal += turnTotal;
-        computerScoreText.setText(String.valueOf(computerTotal));
-    }
-
-    public void hold(View view) {
-        switch (whosTurn) {
-            case PLAYER:
-                playerScores(currentTurn);
-                break;
-            case COMPUTER:
-                computerScores(currentTurn);
-                break;
-        }
-        resetTurn();
-        changePlayers();
-    }
-
-    public void reset(View view) {
-        resetScores();
-        dieView.setImageResource(R.drawable.empty);
-        dieView.setContentDescription("Empty die face");
-        whosTurn = this.random.nextBoolean() ? Players.PLAYER : Players.COMPUTER;
-    }
-
-    private int rollDice() {
-        // Roll a random between 1 and 6, update the image, and return the value.
-        int roll = (random.nextInt() % 6) + 1;
-        if (roll < 1) { roll += 6; }
+    private void showRoll(int roll) {
         int die;
         switch (roll) {
             case 1: die = R.drawable.dice1; break;
@@ -194,24 +173,85 @@ public class MainActivity extends AppCompatActivity {
         }
         dieView.setImageResource(die);
         dieView.setContentDescription(String.format(getString(R.string.die_face), die));
+    }
+
+    public void roll(View view) {
+        // if (!currentPlayer()) return;
+        int frame = rollDice();
+        showRoll(frame);
+
+        if (frame == 1) {
+            turnScoreText.setText("");
+            game.setCurrentTurn(0);
+            switchPlayers();
+        } else {
+            actionText.setText("");
+            game.setCurrentTurn(game.getCurrentTurn() + frame);
+            turnScoreText.setText(String.valueOf(game.getCurrentTurn()));
+            checkForWin();
+        }
+        writeGame();
+    }
+
+    private void checkForWin() {
+        int currentTurn = game.getCurrentTurn();
+        switch (game.getCurrentPlayer()) {
+            case PLAYER1: if (game.getPlayer1Score() + currentTurn > 25) playerWins(); break;
+            case PLAYER2: if (game.getPlayer2Score() + currentTurn > 100) computerWins(); break;
+        }
+    }
+
+    public static final String USER_SCORE = "com.davidsouther.scarne.USER_SCORE";
+    private void playerWins() {
+        Intent intent = new Intent(this, WinActivity.class);
+        intent.putExtra(USER_SCORE, String.valueOf(game.getPlayer1Score() + game.getCurrentTurn()));
+        startActivity(intent);
+    }
+
+    private void computerWins() {
+        Intent intent = new Intent(this, LoseActivity.class);
+        intent.putExtra(USER_SCORE, String.valueOf(game.getPlayer1Score() + game.getCurrentTurn()));
+        startActivity(intent);
+    }
+
+    public void hold(View view) {
+        if (!currentPlayer()) return;
+        int currentTurn = game.getCurrentTurn();
+        switch (game.getCurrentPlayer()) {
+            case PLAYER1: game.setPlayer1Score(game.getPlayer1Score() + currentTurn); break;
+            case PLAYER2: game.setPlayer2Score(game.getPlayer2Score() + currentTurn); break;
+        }
+        game.setCurrentTurn(0);
+        switchPlayers();
+        writeGame();
+    }
+
+    private int rollDice() {
+        // Roll a random between 1 and 6, update the image, and return the value.
+        int roll = (random.nextInt() % 6) + 1;
+        if (roll < 1) { roll += 6; }
         return roll;
     }
 
-    private void resetScores() {
-        resetTurn();
-
-        playerTotal = 0;
-        computerTotal = 0;
-
-        computerScoreText.setText("0");
-        playerScoreText.setText("0");
+    private void switchPlayers() {
+        game.setCurrentPlayer(game.getCurrentPlayer() == MultiPlayers.PLAYER1 ? MultiPlayers.PLAYER2 : MultiPlayers.PLAYER1);
     }
 
-    private void resetTurn() {
-        currentTurn = 0;
-        computerTurns = 0;
-        turnScoreText.setText("");
-        dieView.setImageResource(R.drawable.empty);
+    private void writeGame() {
+        mFirebaseDatabase.child("games").child(game.getId()).setValue(game);
+    }
+
+    private boolean currentPlayer() {
+        String currentEmail = "";
+        switch (game.getCurrentPlayer()) {
+            case PLAYER1:
+                currentEmail = game.getPlayer1();
+                break;
+            case PLAYER2:
+                currentEmail = game.getPlayer2();
+                break;
+        }
+        return currentEmail.equals(mUserEmail);
     }
 }
 
@@ -219,9 +259,4 @@ class BadRollException extends RuntimeException {
     public BadRollException(int roll) {
         super(String.format("Tried to roll a six-sided dice and got %d", roll));
     }
-}
-
-enum Players {
-    PLAYER,
-    COMPUTER,
 }
